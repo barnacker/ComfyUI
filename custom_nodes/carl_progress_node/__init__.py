@@ -767,16 +767,20 @@ def patch():
                             _exec_prompt[0] = str(pid)
                             _nodes_exec.clear()
                         if pid == _cur_prompt[0] and node_id not in _nodes_exec:
-                            _nodes_exec.add(node_id)
+                            with _lock:
+                                _nodes_exec.add(node_id)
                             if len(_nodes_exec) >= _cur_prompt[1]:
                                 # close: every unit of this prompt completed —
                                 # freeze as the last-closed result (the engine
                                 # sends no success event to send_sync, so full
                                 # count = authoritative close). Mutate in place
-                                # (rebinding would need `global`); under _lock
-                                # since _cur_nodes_ids reads it lock-free-safe.
-                                _nodes_last.clear()
-                                _nodes_last.update(_nodes_exec)
+                                # (rebinding would desync _cur_nodes_ids' object
+                                # reference) under _lock: the reader only sees
+                                # the set when _cur_prompt[0] is None, so this
+                                # window is otherwise unobserved.
+                                with _lock:
+                                    _nodes_last.clear()
+                                    _nodes_last.update(_nodes_exec)
                             _emit()
             except Exception:
                 pass
