@@ -79,6 +79,48 @@ _nodes_exec = set()       # completed display-node ids of the active prompt
 _nodes_last = set()       # last closed prompt's completed ids (idle bar)
 _STALE_EMPTY = frozenset()
 
+# v4.1: per-hook self-diagnostics, surfaced in the state file payload so a
+# hook that fails to install (or never fires) is visible in the dashboard
+# instead of a silently-zero counter. Each entry:
+#   {import: bool, installed: bool, calls: int, first_err: str|None}
+# Incrementing `calls` inside the wrap is the "the hook actually fires"
+# proof — import+installed can be true while calls stays 0 if the runtime
+# class is never the one being called (the LTX AV-block case).
+_diag = {}
+
+
+_diag_lock = threading.Lock()   # guards _diag, independent of the state _lock
+
+
+def _diag_note(name, **kw):
+    # `import` is a reserved word, so callers pass imp=True/False and it is
+    # mapped onto the documented "import" field here (never stored as "imp").
+    if "imp" in kw:
+        kw["import"] = kw.pop("imp")
+    with _diag_lock:
+        d = _diag.setdefault(name, {"import": False, "installed": False,
+                                    "calls": 0, "first_err": None})
+        d.update(kw)
+
+
+def _diag_calls(name):
+    # Worker-thread path: dedicated lock, no coupling to the state lock.
+    try:
+        with _diag_lock:
+            _diag[name]["calls"] += 1
+    except Exception:
+        pass
+
+
+def _diag_snapshot():
+    # Read-side view; called from _emit/_live_detail while holding the state
+    # _lock, but takes _diag_lock for the copy so it cannot race a writer.
+    try:
+        with _diag_lock:
+            return {k: dict(v) for k, v in _diag.items()}
+    except Exception:
+        return {}
+
 
 def _cur_nodes_ids():
     """Completed node ids for the count: the active prompt's accumulating set.
@@ -170,6 +212,8 @@ def _emit():
             "nodes": {"total": int(_cur_prompt[1]), "done": _nodes_done_n(),
                       "ids": sorted(_cur_nodes_ids()) if _cur_prompt[0] is not None else [],
                       "prompt": _cur_prompt[0]},
+            # v4.1: per-hook install/fire diagnostics (snapshot; takes _diag_lock).
+            "diag": _diag_snapshot(),
         }
     tmp = STATE_PATH + ".tmp"
     try:
@@ -456,16 +500,21 @@ def patch():
     except Exception as e:
         logging.error("carl_progress v2: block hook failed: %r", e)
 
-    # ---- hook 3b (v4): LTX transformer block forwards --------------------
-    # LTX-2.5 = comfy.ldm.lightricks.model.BasicTransformerBlock (throwaway
-    # ViT blocks with no total_blocks publication — grep=0 in model.py). The
-    # block-forward count IS the live unit, exactly like the Wan hook.
+    # ---- hook 3b (v4.1): LTX transformer block forwards -------------------
+    # The block-forward count IS the live unit (same shape as the Wan hook).
+    # v4.1: LTX-2.5 22B loads as the A/V model — LTXAVModel(LTXVModel) with
+    # its blocks = BasicAVTransformerBlock (comfy/ldm/lightricks/av_model.py),
+    # so v4's single-class hook never fired (calls stayed 0, verified). Wrap
+    # BOTH the video and AV block classes; only the one the model actually
+    # instantiates will tick. Diagnostics live in the state file payload.
     try:
         import comfy.ldm.lightricks.model as ltxm
+        _diag_note("ltx_block", imp=True)
         orig_ltx_fwd = ltxm.BasicTransformerBlock.forward
 
         def ltx_block_fwd(self, *a, **k):
             try:
+                _diag_calls("ltx_block")
                 j = _last_open()
                 if j is not None:
                     j["blocks_done"] = int(j.get("blocks_done", 0)) + 1
@@ -477,9 +526,36 @@ def patch():
                 pass
             return orig_ltx_fwd(self, *a, **k)
         ltxm.BasicTransformerBlock.forward = ltx_block_fwd
-        logging.info("carl_progress v4: ltx block hook")
+        _diag_note("ltx_block", installed=True)
+        logging.info("carl_progress v4.1: ltx block hook (video class)")
     except Exception as e:
-        logging.error("carl_progress v4: ltx block hook failed: %r", e)
+        _diag_note("ltx_block", first_err=repr(e)[:200])
+        logging.error("carl_progress v4.1: ltx block hook failed: %r", e)
+
+    try:
+        import comfy.ldm.lightricks.av_model as ltxav
+        _diag_note("ltx_av_block", imp=True)
+        orig_ltxav_fwd = ltxav.BasicAVTransformerBlock.forward
+
+        def ltxav_block_fwd(self, *a, **k):
+            try:
+                _diag_calls("ltx_av_block")
+                j = _last_open()
+                if j is not None:
+                    j["blocks_done"] = int(j.get("blocks_done", 0)) + 1
+                    now = time.time()
+                    if now - j.get("_be", 0.0) >= 0.033:
+                        j["_be"] = now
+                        _emit()
+            except Exception:
+                pass
+            return orig_ltxav_fwd(self, *a, **k)
+        ltxav.BasicAVTransformerBlock.forward = ltxav_block_fwd
+        _diag_note("ltx_av_block", installed=True)
+        logging.info("carl_progress v4.1: ltx block hook (AV class)")
+    except Exception as e:
+        _diag_note("ltx_av_block", first_err=repr(e)[:200])
+        logging.error("carl_progress v4.1: ltx AV block hook failed: %r", e)
 
     # ---- hook 3c (v4): LTX video VAE decode chunks ------------------------
     # LTX-2.5 video VAE (sd.py:749) = comfy.ldm.lightricks.vae.causal_video_autoencoder.
@@ -625,29 +701,38 @@ def patch():
     except Exception as e:
         logging.error("carl_progress v2: vae hook failed: %r", e)
 
-    # ---- hook 5 (v4): per-node engine-truth units -------------------------
-    # Denominator: PromptQueue.put sees the exact prompt about to run
-    # (prompt = {node_id: {...}}) — node count is the total.
-    # Numerator: PromptServer.send_sync("executed", {...}) fires per completed
-    # node (execution.py:578) — the engine's own record, no in-process guess.
-    # Close: execution_success stops counting, freezes the set to _nodes_last.
-    try:
-        import queue_management
-        orig_put = queue_management.PromptQueue.put
+    # ---- hook 5 (v4.1): per-node engine-truth units -----------------------
+    # Every node of the active prompt counts; single-shot nodes are 1 unit
+    # (true/false completed). Two independent wraps, each with its own
+    # try + per-hook diag in the state file payload (v4's shared try let
+    # one dead import kill both hooks silently — the 09-11 failure).
+    #
+    # Denominator: PromptQueue.put executed.py:1262 — server.py:1131 calls
+    # self.prompt_queue.put((number, prompt_id, prompt, extra_data,
+    # outputs_to_execute, sensitive)); item[1] = prompt_id, item[2] = the
+    # node map, len(node_map) = total units. (This ComfyUI build has NO
+    # queue_management module — it lives in execution.py.)
+    #
+    # Numerator: PromptServer.send_sync("executed", {"node", "display_node",
+    # "output", "prompt_id"}, sid) — execution.py:578, the engine's own
+    # per-node completion record.
 
-        def pq_put(self, priority, item, *a, **k):
+    try:
+        import execution
+        _diag_note("node_put", imp=True)
+        orig_put = execution.PromptQueue.put
+
+        def pq_put(self, item, *a, **k):
             try:
+                _diag_calls("node_put")
                 pid = None
                 pmap = None
                 if isinstance(item, dict):
                     pid = item.get("prompt_id", item.get("id"))
                     pmap = item.get("prompt")
-                    if pmap is None:
-                        p = item.get("parameters", {})
-                        pmap = p.get("prompt") if isinstance(p, dict) else None
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    pmap = item[2] if len(item) > 2 else None
+                elif isinstance(item, (list, tuple)) and len(item) >= 3:
                     pid = item[1]
+                    pmap = item[2]
                 if pid is not None and isinstance(pmap, dict):
                     with _lock:
                         _cur_prompt[0] = str(pid)
@@ -658,34 +743,50 @@ def patch():
                     _emit()
             except Exception:
                 pass
-            return orig_put(self, priority, item, *a, **k)
-        queue_management.PromptQueue.put = pq_put
-        logging.info("carl_progress v4: prompt-put hook")
+            return orig_put(self, item, *a, **k)
+        execution.PromptQueue.put = pq_put
+        _diag_note("node_put", installed=True)
+        logging.info("carl_progress v4.1: prompt-put hook")
+    except Exception as e:
+        _diag_note("node_put", first_err=repr(e)[:200])
+        logging.error("carl_progress v4.1: prompt-put hook failed: %r", e)
 
+    try:
         from server import PromptServer
+        _diag_note("node_executed", imp=True)
         orig_send = PromptServer.send_sync
 
         def ps_send(self, event, data, sid, *a, **k):
             try:
                 if event == "executed" and isinstance(data, dict):
+                    _diag_calls("node_executed")
                     pid = str(data.get("prompt_id", ""))
                     node_id = data.get("display_node", data.get("node"))
                     if node_id is not None and pid:
                         if _exec_prompt[0] != _cur_prompt[0]:
-                            _exec_prompt[0] = str(_cur_prompt[0])
+                            _exec_prompt[0] = str(pid)
                             _nodes_exec.clear()
-                            if _exec_prompt[0] == pid:
-                                _nodes_last.clear()
                         if pid == _cur_prompt[0] and node_id not in _nodes_exec:
                             _nodes_exec.add(node_id)
+                            if len(_nodes_exec) >= _cur_prompt[1]:
+                                # close: every unit of this prompt completed —
+                                # freeze as the last-closed result (the engine
+                                # sends no success event to send_sync, so full
+                                # count = authoritative close). Mutate in place
+                                # (rebinding would need `global`); under _lock
+                                # since _cur_nodes_ids reads it lock-free-safe.
+                                _nodes_last.clear()
+                                _nodes_last.update(_nodes_exec)
                             _emit()
             except Exception:
                 pass
             return orig_send(self, event, data, sid, *a, **k)
         PromptServer.send_sync = ps_send
-        logging.info("carl_progress v4: send_sync node hook")
+        _diag_note("node_executed", installed=True)
+        logging.info("carl_progress v4.1: send_sync node hook")
     except Exception as e:
-        logging.error("carl_progress v4: per-node hooks failed: %r", e)
+        _diag_note("node_executed", first_err=repr(e)[:200])
+        logging.error("carl_progress v4.1: send_sync node hook failed: %r", e)
 
     _clip_monitor()  # encode-phase tracker (see below)
 
@@ -709,6 +810,8 @@ def _live_detail():
             "nodes": {"total": int(_cur_prompt[1]), "done": _nodes_done_n(),
                       "ids": sorted(_cur_nodes_ids()) if _cur_prompt[0] is not None else [],
                       "prompt": _cur_prompt[0]},
+            # v4.1: per-hook install/fire diagnostics (snapshot; takes _diag_lock).
+            "diag": _diag_snapshot(),
         }
         for j in detail["jobs"]:
             j.pop("_last_t", None)
